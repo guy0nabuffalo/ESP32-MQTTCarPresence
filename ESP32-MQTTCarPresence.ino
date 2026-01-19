@@ -3,6 +3,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
 
 const char *wifiSSID = "wifissid";                  // Your WiFi network name
 const char *wifiPassword = "wifipassword";          // Your WiFi network password
@@ -35,7 +36,8 @@ PubSubClient mqttClient(wifiClient);
 
 #define WIFI_STATUS_PIN 2 // Assuming onboard LED is connected to pin 2. Change if necessary.
 
-#define WIFI_TIMEOUT_MS 30000 // Adjust timeout according to your needs
+#define WIFI_TIMEOUT_MS 20000 // WiFi connection timeout (20 seconds)
+#define WDT_TIMEOUT 60 // Watchdog timeout in seconds
 
 void keepWifiAlive(void *parameters)
 {
@@ -43,18 +45,31 @@ void keepWifiAlive(void *parameters)
   {
     if (WiFi.status() == WL_CONNECTED)
     {
-      Serial.print("WiFi still connected: ");
+      Serial.print("[WIFI] Still connected: ");
       Serial.println(WiFi.localIP().toString().c_str());
       digitalWrite(WIFI_STATUS_PIN, HIGH);
       vTaskDelay(10000 / portTICK_PERIOD_MS);
       continue;
     }
 
-    Serial.println("WiFi Connecting");
+    // WiFi not connected, attempt to connect
+    Serial.println("[WIFI] Not connected, attempting connection...");
+    Serial.print("[WIFI] Scanning for SSID: ");
+    Serial.println(wifiSSID);
+
+    // Disconnect and clear any existing configuration
+    WiFi.disconnect(true);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    // Set WiFi mode and disable auto-reconnect (we control reconnection)
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+
+    // Begin connection
     WiFi.begin(wifiSSID, wifiPassword);
     unsigned long startAttemptTime = millis();
 
+    // Wait for connection with timeout
     while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < WIFI_TIMEOUT_MS)
     {
       digitalWrite(WIFI_STATUS_PIN, HIGH);
@@ -62,40 +77,81 @@ void keepWifiAlive(void *parameters)
       vTaskDelay(500 / portTICK_PERIOD_MS);
       digitalWrite(WIFI_STATUS_PIN, LOW);
       vTaskDelay(500 / portTICK_PERIOD_MS);
-      continue;
     }
 
     if (WiFi.status() == WL_CONNECTED)
     {
-      Serial.print("[WIFI] Connected: ");
+      Serial.println();
+      Serial.print("[WIFI] Connected successfully: ");
       Serial.println(WiFi.localIP().toString().c_str());
+      Serial.print("[WIFI] Signal strength: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
       digitalWrite(WIFI_STATUS_PIN, HIGH);
     }
     else
     {
-      Serial.println("[WIFI] Failed to Connect before timeout");
+      Serial.println();
+      Serial.println("[WIFI] Connection failed - will retry");
+      Serial.print("[WIFI] Status code: ");
+      Serial.println(WiFi.status());
       digitalWrite(WIFI_STATUS_PIN, LOW);
+      // Short delay before retry to allow for scanning
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
     }
   }
 }
 
 void setupWifi()
 {
-  Serial.print("Connecting to WiFi network: " + String(wifiSSID));
+  Serial.println("[WIFI] Initial WiFi setup...");
+
+  // Set hostname before connecting
   WiFi.setHostname(mqttNode.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false); // We control reconnection via keepWifiAlive task
+
+  // Disable WiFi sleep mode for constant scanning
+  WiFi.setSleep(false);
+
+  Serial.print("[WIFI] Attempting to connect to: ");
+  Serial.println(wifiSSID);
+
   WiFi.begin(wifiSSID, wifiPassword);
 
-  while (WiFi.status() != WL_CONNECTED)
+  // Wait for connection with timeout (not infinite loop)
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS)
   {
-    delay(1);
+    delay(100);
+    Serial.print(".");
   }
-  Serial.println("\nWiFi connected successfully and assigned IP: " + WiFi.localIP().toString());
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.print("[WIFI] Connected successfully! IP: ");
+    Serial.println(WiFi.localIP().toString());
+  }
+  else
+  {
+    Serial.println();
+    Serial.println("[WIFI] Initial connection failed, keepWifiAlive task will handle reconnection");
+  }
 }
 
 void mqttConnect()
 {
+  // Only attempt MQTT connection if WiFi is connected
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[MQTT] Cannot connect - WiFi not connected");
+    return;
+  }
+
   digitalWrite(WIFI_STATUS_PIN, HIGH);
-  Serial.println("Attempting MQTT connection to broker: " + String(mqttServer));
+  Serial.print("[MQTT] Attempting connection to broker: ");
+  Serial.println(mqttServer);
 
   if (mqttClient.connect(mqttNode.c_str(), mqttUser, mqttPassword, mqttDiscoBinaryStateTopic.c_str(), 1, 1, "OFF"))
   {
@@ -103,12 +159,8 @@ void mqttConnect()
     reportTimer = millis();
     String uptimeTimer = String(millis());
 
-    Serial.println("MQTT discovery connectivity config: [" + mqttDiscoBinaryConfigTopic + "] : [" + mqttDiscoBinaryConfigPayload + "]");
-    Serial.println("MQTT discovery connectivity state: [" + mqttDiscoBinaryStateTopic + "] : [ON]");
-    Serial.println("MQTT discovery signal config: [" + mqttDiscoSignalConfigTopic + "] : [" + mqttDiscoSignalConfigPayload + "]");
-    Serial.println("MQTT discovery signal state: [" + mqttDiscoSignalStateTopic + "] : " + WiFi.RSSI());
-    Serial.println("MQTT discovery uptime config: [" + mqttDiscoUptimeConfigTopic + "] : [" + mqttDiscoUptimeConfigPayload + "]");
-    Serial.println("MQTT discovery uptime state: [" + mqttDiscoUptimeStateTopic + "] : " + uptimeTimer);
+    Serial.println("[MQTT] Connected successfully!");
+    Serial.println("[MQTT] Publishing discovery configs...");
 
     mqttClient.publish(mqttDiscoUptimeConfigTopic.c_str(), mqttDiscoUptimeConfigPayload.c_str(), true);
     mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str());
@@ -117,12 +169,13 @@ void mqttConnect()
     mqttClient.publish(mqttDiscoSignalConfigTopic.c_str(), mqttDiscoSignalConfigPayload.c_str(), true);
     mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str());
 
-    Serial.println("MQTT connected");
+    Serial.println("[MQTT] Discovery messages published");
     digitalWrite(WIFI_STATUS_PIN, LOW);
   }
   else
   {
-    Serial.println("MQTT connection failed, rc=" + String(mqttClient.state()));
+    Serial.print("[MQTT] Connection failed, rc=");
+    Serial.println(mqttClient.state());
   }
 }
 
@@ -161,16 +214,56 @@ void mqtt_callback(char *topic, byte *payload, unsigned int payloadLength)
 {
 }
 
+void WiFiEvent(WiFiEvent_t event)
+{
+  switch (event)
+  {
+  case SYSTEM_EVENT_STA_GOT_IP:
+    Serial.println("[WIFI EVENT] Connected to WiFi, IP: " + WiFi.localIP().toString());
+    break;
+  case SYSTEM_EVENT_STA_DISCONNECTED:
+    Serial.println("[WIFI EVENT] Disconnected from WiFi");
+    break;
+  case SYSTEM_EVENT_STA_START:
+    Serial.println("[WIFI EVENT] WiFi started");
+    break;
+  case SYSTEM_EVENT_STA_STOP:
+    Serial.println("[WIFI EVENT] WiFi stopped");
+    break;
+  default:
+    break;
+  }
+}
+
 void setup()
 {
   pinMode(WIFI_STATUS_PIN, OUTPUT);
   digitalWrite(WIFI_STATUS_PIN, HIGH);
 
   Serial.begin(115200);
-  Serial.println("\nHardware initialized, starting program load");
+  delay(500); // Give serial time to initialize
+  Serial.println("\n\n========================================");
+  Serial.println("[SYSTEM] ESP32 MQTT Car Presence");
+  Serial.println("[SYSTEM] Starting initialization...");
+  Serial.println("========================================");
 
+  // Configure and enable hardware watchdog timer
+  Serial.print("[SYSTEM] Configuring watchdog timer (");
+  Serial.print(WDT_TIMEOUT);
+  Serial.println(" seconds)...");
+  esp_task_wdt_init(WDT_TIMEOUT, true); // Enable panic so ESP32 restarts
+  esp_task_wdt_add(NULL);                // Add current thread to WDT watch
+  Serial.println("[SYSTEM] Watchdog timer enabled");
+
+  // Register WiFi event handler
+  WiFi.onEvent(WiFiEvent);
+  Serial.println("[SYSTEM] WiFi event handler registered");
+
+  // Initial WiFi setup
   setupWifi();
 
+  // Create WiFi keep-alive task on core 0
+  Serial.println("[SYSTEM] Creating WiFi keep-alive task...");
   xTaskCreatePinnedToCore(
       keepWifiAlive,
       "keepWifiAlive",
@@ -179,56 +272,80 @@ void setup()
       1,
       NULL,
       0);
+  Serial.println("[SYSTEM] WiFi keep-alive task started on core 0");
 
+  // Setup MQTT
   mqttClient.setServer(mqttServer, 1883);
   mqttClient.setCallback(mqtt_callback);
-
   mqttClient.setBufferSize(512);
+  Serial.println("[SYSTEM] MQTT client configured");
 
   mqttConnect();
 
+  // Setup OTA if password is set
   if (otaPassword[0])
   {
     setupOTA();
   }
+  else
+  {
+    Serial.println("[SYSTEM] OTA updates disabled (no password set)");
+  }
 
-  Serial.println("Initialization complete\n");
+  Serial.println("========================================");
+  Serial.println("[SYSTEM] Initialization complete!");
+  Serial.println("========================================\n");
 }
 
 void loop()
 {
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    setupWifi();
-  }
+  // Feed the watchdog timer to prevent reset
+  esp_task_wdt_reset();
 
-  if (!mqttClient.connected())
+  // WiFi reconnection is handled by keepWifiAlive task
+  // Only attempt MQTT connection if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected())
   {
     mqttConnect();
   }
 
+  // Process MQTT messages if connected
   if (mqttClient.connected())
   {
     mqttClient.loop();
   }
 
+  // Twinkle LED when MQTT is connected (visual indicator)
   if (mqttClient.connected() && ((millis() - twinkleTimer) >= twinkleInterval))
   {
     digitalWrite(WIFI_STATUS_PIN, !digitalRead(WIFI_STATUS_PIN));
     twinkleTimer = millis();
   }
 
+  // Publish periodic updates when MQTT is connected
   if (mqttClient.connected() && ((millis() - reportTimer) >= reportInterval))
   {
     String signalStrength = String(WiFi.RSSI());
     String uptimeTimer = String(millis());
-    mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str());
-    mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str());
-    reportTimer = millis();
+
+    if (mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str()) &&
+        mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str()))
+    {
+      // Successfully published
+      reportTimer = millis();
+    }
+    else
+    {
+      Serial.println("[MQTT] Failed to publish update");
+    }
   }
 
+  // Handle OTA updates if enabled
   if (otaPassword[0])
   {
     ArduinoOTA.handle();
   }
+
+  // Small delay to prevent tight loop
+  delay(10);
 }
