@@ -38,10 +38,7 @@ PubSubClient mqttClient(wifiClient);
 
 #define WIFI_TIMEOUT_MS 20000 // WiFi connection timeout (20 seconds)
 #define WDT_TIMEOUT 60 // Watchdog timeout in seconds
-#define WIFI_CHECK_INTERVAL_MS 3000 // How often to check WiFi status when connected (3 seconds for faster reconnection)
-#define MQTT_RECONNECT_INTERVAL_MS 5000 // Minimum time between MQTT reconnection attempts
-
-unsigned long lastMqttConnectAttempt = 0; // Track last MQTT connection attempt
+#define WIFI_CHECK_INTERVAL_MS 1000 // How often to check WiFi status when connected (1 second for faster reconnection)
 
 void keepWifiAlive(void *parameters)
 {
@@ -55,7 +52,7 @@ void keepWifiAlive(void *parameters)
 
     if (WiFi.status() == WL_CONNECTED)
     {
-      // Check more frequently (3s) for faster disconnect detection when driving away
+      // Check frequently (1s) for faster disconnect detection when driving away
       vTaskDelay(WIFI_CHECK_INTERVAL_MS / portTICK_PERIOD_MS);
       continue;
     }
@@ -179,11 +176,11 @@ void mqttConnect()
     Serial.println("[MQTT] Publishing discovery configs...");
 
     mqttClient.publish(mqttDiscoUptimeConfigTopic.c_str(), mqttDiscoUptimeConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str(), true);
+    mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str());
     mqttClient.publish(mqttDiscoBinaryConfigTopic.c_str(), mqttDiscoBinaryConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoBinaryStateTopic.c_str(), "ON", true);  // Retained so HA knows state after restart
+    mqttClient.publish(mqttDiscoBinaryStateTopic.c_str(), "ON");
     mqttClient.publish(mqttDiscoSignalConfigTopic.c_str(), mqttDiscoSignalConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str(), true);
+    mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str());
 
     Serial.println("[MQTT] Discovery messages published");
     digitalWrite(WIFI_STATUS_PIN, LOW);
@@ -338,15 +335,10 @@ void loop()
   esp_task_wdt_reset();
 
   // WiFi reconnection is handled by keepWifiAlive task
-  // Only attempt MQTT connection if WiFi is connected, with backoff to prevent spamming
+  // Only attempt MQTT connection if WiFi is connected
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected())
   {
-    unsigned long now = millis();
-    if (now - lastMqttConnectAttempt >= MQTT_RECONNECT_INTERVAL_MS)
-    {
-      lastMqttConnectAttempt = now;
-      mqttConnect();
-    }
+    mqttConnect();
   }
 
   // Process MQTT messages if connected
@@ -368,8 +360,8 @@ void loop()
     String signalStrength = String(WiFi.RSSI());
     String uptimeTimer = String(millis());
 
-    if (mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str(), true) &&
-        mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str(), true))
+    if (mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str()) &&
+        mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str()))
     {
       // Successfully published
       reportTimer = millis();
