@@ -38,23 +38,31 @@ PubSubClient mqttClient(wifiClient);
 
 #define WIFI_TIMEOUT_MS 20000 // WiFi connection timeout (20 seconds)
 #define WDT_TIMEOUT 60 // Watchdog timeout in seconds
+#define WIFI_CHECK_INTERVAL_MS 3000 // How often to check WiFi status when connected (3 seconds for faster reconnection)
+#define MQTT_RECONNECT_INTERVAL_MS 5000 // Minimum time between MQTT reconnection attempts
+
+unsigned long lastMqttConnectAttempt = 0; // Track last MQTT connection attempt
 
 void keepWifiAlive(void *parameters)
 {
+  // Add this task to watchdog monitoring
+  esp_task_wdt_add(NULL);
+
   for (;;)
   {
+    // Feed watchdog from this task
+    esp_task_wdt_reset();
+
     if (WiFi.status() == WL_CONNECTED)
     {
-      Serial.print("[WIFI] Still connected: ");
-      Serial.println(WiFi.localIP().toString().c_str());
-      digitalWrite(WIFI_STATUS_PIN, HIGH);
-      vTaskDelay(10000 / portTICK_PERIOD_MS);
+      // Check more frequently (3s) for faster disconnect detection when driving away
+      vTaskDelay(WIFI_CHECK_INTERVAL_MS / portTICK_PERIOD_MS);
       continue;
     }
 
     // WiFi not connected, attempt to connect
     Serial.println("[WIFI] Not connected, attempting connection...");
-    Serial.print("[WIFI] Scanning for SSID: ");
+    Serial.print("[WIFI] Connecting to SSID: ");
     Serial.println(wifiSSID);
 
     // Disconnect and clear any existing configuration
@@ -87,6 +95,10 @@ void keepWifiAlive(void *parameters)
       Serial.print("[WIFI] Signal strength: ");
       Serial.print(WiFi.RSSI());
       Serial.println(" dBm");
+
+      // Re-apply WiFi sleep disable after reconnection for constant scanning
+      WiFi.setSleep(false);
+
       digitalWrite(WIFI_STATUS_PIN, HIGH);
     }
     else
@@ -153,7 +165,11 @@ void mqttConnect()
   Serial.print("[MQTT] Attempting connection to broker: ");
   Serial.println(mqttServer);
 
-  if (mqttClient.connect(mqttNode.c_str(), mqttUser, mqttPassword, mqttDiscoBinaryStateTopic.c_str(), 1, 1, "OFF"))
+  // Use NULL for empty username/password to avoid authentication issues
+  const char* user = (mqttUser[0] != '\0') ? mqttUser : NULL;
+  const char* pass = (mqttPassword[0] != '\0') ? mqttPassword : NULL;
+
+  if (mqttClient.connect(mqttNode.c_str(), user, pass, mqttDiscoBinaryStateTopic.c_str(), 1, 1, "OFF"))
   {
     String signalStrength = String(WiFi.RSSI());
     reportTimer = millis();
@@ -163,11 +179,11 @@ void mqttConnect()
     Serial.println("[MQTT] Publishing discovery configs...");
 
     mqttClient.publish(mqttDiscoUptimeConfigTopic.c_str(), mqttDiscoUptimeConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str());
+    mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str(), true);
     mqttClient.publish(mqttDiscoBinaryConfigTopic.c_str(), mqttDiscoBinaryConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoBinaryStateTopic.c_str(), "ON");
+    mqttClient.publish(mqttDiscoBinaryStateTopic.c_str(), "ON", true);  // Retained so HA knows state after restart
     mqttClient.publish(mqttDiscoSignalConfigTopic.c_str(), mqttDiscoSignalConfigPayload.c_str(), true);
-    mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str());
+    mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str(), true);
 
     Serial.println("[MQTT] Discovery messages published");
     digitalWrite(WIFI_STATUS_PIN, LOW);
@@ -218,6 +234,22 @@ void WiFiEvent(WiFiEvent_t event)
 {
   switch (event)
   {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(2, 0, 0)
+  // New event names for ESP32 Arduino Core 2.0.0+
+  case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+    Serial.println("[WIFI EVENT] Connected to WiFi, IP: " + WiFi.localIP().toString());
+    break;
+  case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+    Serial.println("[WIFI EVENT] Disconnected from WiFi");
+    break;
+  case ARDUINO_EVENT_WIFI_STA_START:
+    Serial.println("[WIFI EVENT] WiFi started");
+    break;
+  case ARDUINO_EVENT_WIFI_STA_STOP:
+    Serial.println("[WIFI EVENT] WiFi stopped");
+    break;
+#else
+  // Legacy event names for older ESP32 Arduino Core
   case SYSTEM_EVENT_STA_GOT_IP:
     Serial.println("[WIFI EVENT] Connected to WiFi, IP: " + WiFi.localIP().toString());
     break;
@@ -230,6 +262,7 @@ void WiFiEvent(WiFiEvent_t event)
   case SYSTEM_EVENT_STA_STOP:
     Serial.println("[WIFI EVENT] WiFi stopped");
     break;
+#endif
   default:
     break;
   }
@@ -278,6 +311,8 @@ void setup()
   mqttClient.setServer(mqttServer, 1883);
   mqttClient.setCallback(mqtt_callback);
   mqttClient.setBufferSize(512);
+  mqttClient.setSocketTimeout(10);  // 10 second socket timeout to prevent long blocking
+  mqttClient.setKeepAlive(30);      // 30 second keepalive for faster disconnect detection
   Serial.println("[SYSTEM] MQTT client configured");
 
   mqttConnect();
@@ -303,10 +338,15 @@ void loop()
   esp_task_wdt_reset();
 
   // WiFi reconnection is handled by keepWifiAlive task
-  // Only attempt MQTT connection if WiFi is connected
+  // Only attempt MQTT connection if WiFi is connected, with backoff to prevent spamming
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected())
   {
-    mqttConnect();
+    unsigned long now = millis();
+    if (now - lastMqttConnectAttempt >= MQTT_RECONNECT_INTERVAL_MS)
+    {
+      lastMqttConnectAttempt = now;
+      mqttConnect();
+    }
   }
 
   // Process MQTT messages if connected
@@ -328,8 +368,8 @@ void loop()
     String signalStrength = String(WiFi.RSSI());
     String uptimeTimer = String(millis());
 
-    if (mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str()) &&
-        mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str()))
+    if (mqttClient.publish(mqttDiscoSignalStateTopic.c_str(), signalStrength.c_str(), true) &&
+        mqttClient.publish(mqttDiscoUptimeStateTopic.c_str(), uptimeTimer.c_str(), true))
     {
       // Successfully published
       reportTimer = millis();
